@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>手势魔法烟花 - Gesture Fireworks</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        #webcam {
+            transform: scaleX(-1); /* 镜像翻转，符合镜子习惯 */
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="fireworksCanvas" class="absolute top-0 left-0 w-full h-full z-10"></canvas>
+
+    <div class="absolute inset-0 flex flex-col justify-between p-8 z-20 pointer-events-none">
+        <div class="w-full flex flex-col items-center mt-4">
+            <h1 class="text-2xl font-black tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-fuchsia-500 uppercase">Gesture Fireworks</h1>
+            <div id="statusTip" class="mt-4 px-6 py-2 rounded-full bg-black/40 border border-white/10 text-white/80 text-sm tracking-wide backdrop-blur-md transition-all duration-300">
+                等待启动系统...
+            </div>
+        </div>
+
+        <div class="absolute top-4 right-4 w-40 h-30 rounded-xl overflow-hidden border border-white/10 bg-black/50 shadow-2xl transition-opacity duration-500 opacity-40 hover:opacity-100">
+            <video id="webcam" class="w-full h-full object-cover" autoplay playsinline></video>
+        </div>
+
+        <div class="w-full max-w-md mx-auto mb-6 transition-all duration-300 opacity-0 transform translate-y-4" id="chargeBarContainer">
+            <div class="flex justify-between text-xs text-cyan-400 mb-1 font-mono">
+                <span>MANA CHARGING</span>
+                <span id="chargePercent">0%</span>
+            </div>
+            <div class="w-full h-1.5 bg-white/10 rounded-full overflow-hidden backdrop-blur-sm">
+                <div id="chargeBar" class="h-full w-0 bg-gradient-to-r from-cyan-400 via-purple-500 to-fuchsia-500 shadow-[0_0_12px_#00f3ff]"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="setupOverlay" class="absolute inset-0 z-30 flex flex-col items-center justify-center bg-black transition-opacity duration-700">
+        <div class="text-center max-w-sm px-6">
+            <div id="loadingIcon" class="w-12 h-12 border-4 border-cyan-400 border-t-transparent rounded-full animate-spin mx-auto mb-6 hidden"></div>
+            <h2 id="setupTitle" class="text-3xl font-bold text-white mb-4 tracking-wide">手势魔法烟花</h2>
+            <p id="setupDesc" class="text-gray-400 text-sm mb-8 leading-relaxed">
+                允许使用摄像头，通过AI识别手势：<br>
+                ✊ <b>握拳</b> 蓄力魔法 &nbsp;&nbsp; 🖐 <b>张开</b> 释放烟花<br>
+                🙌 <b>双手大张</b> 触发全屏终极风暴
+            </p>
+            <button id="startBtn" class="pointer-events-auto px-8 py-3 rounded-xl bg-gradient-to-r from-cyan-500 to-fuchsia-600 text-white font-medium tracking-wider shadow-lg shadow-cyan-500/20 hover:shadow-fuchsia-500/40 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 cursor-pointer">
+                开启交互魔法
+            </button>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('fireworksCanvas');
+        const ctx = canvas.getContext('2d');
+        const videoElement = document.getElementById('webcam');
+        const startBtn = document.getElementById('startBtn');
+        const setupOverlay = document.getElementById('setupOverlay');
+        const loadingIcon = document.getElementById('loadingIcon');
+        const setupTitle = document.getElementById('setupTitle');
+        const setupDesc = document.getElementById('setupDesc');
+        const statusTip = document.getElementById('statusTip');
+        const chargeBarContainer = document.getElementById('chargeBarContainer');
+        const chargeBar = document.getElementById('chargeBar');
+        const chargePercent = document.getElementById('chargePercent');
+
+        // 赛博朋克/极光色系库
+        const colors = {
+            cyan: '#00f3ff',
+            magenta: '#ff007f',
+            purple: '#9d4edd',
+            gold: '#ffb703',
+            mint: '#00f5d4'
+        };
+        const colorArray = Object.values(colors);
+
+        // 系统核心状态变量
+        let particles = [];
+        let rockets = [];
+        let sparks = []; // 蓄力吸入粒子
+        let screenShake = 0;
+        let flashOpacity = 0;
+
+        // 手势追踪与蓄力状态机
+        let isCharging = false;
+        let chargeTime = 0; // 秒
+        const MAX_CHARGE_TIME = 3.0;
+        let lastHandState = 'open'; // 'open' 或 'fist'，用于检测突变瞬间
+        let handPos = { x: window.innerWidth / 2, y: window.innerHeight * 0.7 }; // 映射后的手部屏幕坐标
+
+        // 初始化画布大小
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // --- 物理粒子系统对象定义 ---
+
+        // 1. 烟花主体爆炸粒子
+        class Particle {
+            constructor(x, y, color, speedMultiplier = 1, angle = null, speed = null) {
+                this.x = x;
+                this.y = y;
+                this.color = color;
+                const a = angle !== null ? angle : Math.random() * Math.PI * 2;
+                const s = speed !== null ? speed : (Math.random() * 5 + 2) * speedMultiplier;
+                this.vx = Math.cos(a) * s;
+                this.vy = Math.sin(a) * s;
+                this.gravity = 0.06;
+                this.friction = 0.96; // 空气阻力
+                this.alpha = 1;
+                this.decay = Math.random() * 0.01 + 0.008;
+                this.radius = Math.random() * 2 + 1.5;
+            }
+            update() {
+                this.vx *= this.friction;
+                this.vy *= this.friction;
+                this.vy += this.gravity;
+                this.x += this.vx;
+                this.y += this.vy;
+                this.alpha -= this.decay;
+            }
+            draw() {
+                ctx.save();
+                ctx.globalAlpha = this.alpha;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fillStyle = this.color;
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = this.color;
+                ctx.fill();
+                ctx.restore();
+            }
+        }
+
+        // 2. 烟花发射火箭（尾迹彗星）
+        class Rocket {
+            constructor(startX, startY, targetY, chargeRatio) {
+                this.x = startX;
+                this.y = startY;
+                this.targetY = targetY;
+                this.chargeRatio = chargeRatio;
+                this.vy = -(Math.random() * 4 + 12);
+                this.vx = (Math.random() - 0.5) * 2;
+                this.color = colorArray[Math.floor(Math.random() * colorArray.length)];
+                this.alive = true;
+            }
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+                // 产生上升尾迹粒子
+                if (Math.random() < 0.6) {
+                    particles.push(new Particle(this.x, this.y, this.color, 0.2));
+                }
+                if (this.y <= this.targetY || this.vy >= 0) {
+                    this.alive = false;
+                    explode(this.x, this.y, this.chargeRatio, this.color);
+                }
+            }
+            draw() {
+                ctx.save();
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, 3, 0, Math.PI * 2);
+                ctx.fillStyle = '#fff';
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = this.color;
+                ctx.fill();
+                ctx.restore();
+            }
+        }
+
+        // 3. 蓄力吸入光点粒子
+        class Spark {
+            constructor(targetX, targetY, maxRadius) {
+                const angle = Math.random() * Math.PI * 2;
+                const distance = Math.random() * 120 + maxRadius + 20;
+                this.x = targetX + Math.cos(angle) * distance;
+                this.y = targetY + Math.sin(angle) * distance;
+                this.targetX = targetX;
+                this.targetY = targetY;
+                this.color = '#fff';
+                this.speed = Math.random() * 4 + 3;
+                this.alive = true;
+                this.radius = Math.random() * 1.5 + 0.5;
+            }
+            update(tx, ty) {
+                this.targetX = tx;
+                this.targetY = ty;
+                const dx = this.targetX - this.x;
+                const dy = this.targetY - this.y;
+                const dist = Math.hypot(dx, dy);
+                if (dist < 8) {
+                    this.alive = false;
+                } else {
+                    this.x += (dx / dist) * this.speed;
+                    this.y += (dy / dist) * this.speed;
+                }
+            }
+            draw() {
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fillStyle = this.color;
+                ctx.fill();
+            }
+        }
+
+        // --- 核心烟花爆炸逻辑算法 ---
+        function explode(x, y, chargeRatio, baseColor) {
+            // 根据蓄力比例决定粒子基数
+            const pCount = Math.floor(60 + chargeRatio * 120);
+            const speedMultiplier = 1 + chargeRatio * 1.5;
+            screenShake = Math.floor(chargeRatio * 12); // 爆炸震屏
+
+            // 基础内冠爆炸
+            for (let i = 0; i < pCount; i++) {
+                particles.push(new Particle(x, y, baseColor, speedMultiplier));
+            }
+
+            // 完美高阶蓄力（>85%）触发豪华复合双层爆炸
+            if (chargeRatio > 0.85) {
+                const subColor = colorArray[Math.floor(Math.random() * colorArray.length)];
+                // 外圈物理原子环
+                for (let i = 0; i < 45; i++) {
+                    const angle = (i / 45) * Math.PI * 2;
+                    particles.push(new Particle(x, y, subColor, speedMultiplier * 1.4, angle, speedMultiplier * 6));
+                }
+            }
+        }
+
+        // 终极全屏风暴（双手张开）
+        function triggerUltimate() {
+            flashOpacity = 0.6; // 瞬间闪白
+            screenShake = 25;   // 强震动
+            statusTip.innerText = "🙌 终极魔法：全屏烟花暴风雨！";
+            statusTip.className = statusTip.className.replace('text-white/80', 'text-fuchsia-400 font-bold border-fuchsia-500/50 shadow-[0_0_15px_rgba(240,46,170,0.4)]');
+
+            // 连续在随机位置炸开5组特殊造型或超大烟花
+            for (let k = 0; k < 6; k++) {
+                setTimeout(() => {
+                    const rx = Math.random() * (canvas.width * 0.7) + canvas.width * 0.15;
+                    const ry = Math.random() * (canvas.height * 0.4) + canvas.height * 0.15;
+                    const randomColor = colorArray[Math.floor(Math.random() * colorArray.length)];
+                    
+                    // 制造特殊形态：星形/环形复合爆炸
+                    for (let i = 0; i < 120; i++) {
+                        const angle = Math.random() * Math.PI * 2;
+                        // 运用数学公式做形态畸变，制造星状散落
+                        const modifier = (k % 2 === 0) ? (Math.sin(angle * 5) * 0.3 + 1) : 1; 
+                        const speed = (Math.random() * 4 + 4) * modifier;
+                        particles.push(new Particle(rx, ry, randomColor, 1, angle, speed));
+                    }
+                }, k * 180);
+            }
+        }
+
+        // --- 画布主渲染循环动画 ---
+        function renderLoop() {
+            ctx.save();
+            // 经典的半透明覆盖层，生成高质感流光拖尾
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.12)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // 模拟镜头震动 (Screen Shake)
+            if (screenShake > 0) {
+                const dx = (Math.random() - 0.5) * screenShake;
+                const dy = (Math.random() - 0.5) * screenShake;
+                ctx.translate(dx, dy);
+                screenShake *= 0.9; // 震动衰减
+                if (screenShake < 0.5) screenShake = 0;
+            }
+
+            // 渲染蓄力吸入粒子
+            if (isCharging) {
+                const maxRadius = (chargeTime / MAX_CHARGE_TIME) * 35 + 10;
+                // 渲染手部的能量核
+                let gradient = ctx.createRadialGradient(handPos.x, handPos.y, 2, handPos.x, handPos.y, maxRadius);
+                let coreColor = chargeTime > 2.0 ? colors.gold : (chargeTime > 1.0 ? colors.cyan : colors.magenta);
+                gradient.addColorStop(0, '#fff');
+                gradient.addColorStop(0.3, coreColor);
+                gradient.addColorStop(1, 'transparent');
+                
+                ctx.beginPath();
+                ctx.arc(handPos.x, handPos.y, maxRadius, 0, Math.PI * 2);
+                ctx.fillStyle = gradient;
+                ctx.shadowBlur = 30;
+                ctx.shadowColor = coreColor;
+                ctx.fill();
+
+                // 产生并更新吸入的火花
+                if (sparks.length < 40) {
+                    sparks.push(new Spark(handPos.x, handPos.y, maxRadius));
+                }
+            }
+
+            sparks.forEach((spark, index) => {
+                spark.update(handPos.x, handPos.y);
+                if (!spark.alive) sparks.splice(index, 1);
+                else spark.draw();
+            });
+
+            // 更新与绘制火箭
+            rockets.forEach((rocket, index) => {
+                rocket.update();
+                if (!rocket.alive) rockets.splice(index, 1);
+                else rocket.draw();
+            });
+
+            // 更新与绘制爆炸粒子
+            particles.forEach((p, index) => {
+                p.update();
+                if (p.alpha <= 0) particles.splice(index, 1);
+                else p.draw();
+            });
+
+            ctx.restore();
+
+            // 终极全屏闪烁处理
+            if (flashOpacity > 0) {
+                ctx.fillStyle = `rgba(255, 255, 255, ${flashOpacity})`;
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                flashOpacity -= 0.04;
+            }
+
+            requestAnimationFrame(renderLoop);
+        }
+
+        // --- MediaPipe 关键手势识别与计算逻辑 ---
+
+        // 计算单手是否为握拳状态
+        function checkIsFist(landmarks) {
+            // 核心调校核心：对比4根主手指的指尖(Tip)与指根(MCP)的Y坐标。
+            // 注意：MediaPipe 的坐标系中，Y从上到下为0到1，所以指尖Y大于指根Y代表弯曲（即握拳）。
+            const fingerTips = [8, 12, 16, 20];  // 食指、中指、无名指、小指尖
+            const fingerMcps = [5, 9, 13, 17];  // 对应的关节根部
+            
+            let bentFingers = 0;
+            for(let i = 0; i < 4; i++) {
+                if(landmarks[fingerTips[i]].y > landmarks[fingerMcps[i]].y) {
+                    bentFingers++;
+                }
+            }
+            // 超过3根手指弯曲，则判定为握拳
+            return bentFingers >= 3;
+        }
+
+        // 处理从 MediaPipe 接收到的实时计算数据
+        function onResults(results) {
+            const numHands = results.multiHandLandmarks ? results.multiHandLandmarks.length : 0;
+
+            // 1. 双手同时张开判断 (终极暴风雨)
+            if (numHands === 2) {
+                const hand1IsFist = checkIsFist(results.multiHandLandmarks[0]);
+                const hand2IsFist = checkIsFist(results.multiHandLandmarks[1]);
+                
+                if (!hand1IsFist && !hand2IsFist) {
+                    if (lastHandState !== 'double_open') {
+                        triggerUltimate();
+                        lastHandState = 'double_open';
+                        isCharging = false;
+                        chargeTime = 0;
+                        chargeBarContainer.classList.add('opacity-0', 'translate-y-4');
+                    }
+                    return;
+                }
+            }
+
+            // 2. 单手交互逻辑
+            if (numHands >= 1) {
+                const landmarks = results.multiHandLandmarks[0];
+                const isFist = checkIsFist(landmarks);
+
+                // 获取手掌中心坐标并平滑映射到Canvas屏幕空间上 (以第9号关键点中指根部为基准)
+                // 运用镜像转换：(1 - x)
+                handPos.x = (1 - landmarks[9].x) * canvas.width;
+                handPos.y = landmarks[9].y * canvas.height;
+
+                if (isFist) {
+                    // 【握拳蓄力状态】
+                    isCharging = true;
+                    lastHandState = 'fist';
+                    
+                    if (chargeTime < MAX_CHARGE_TIME) {
+                        chargeTime += 0.033; // 估算单帧步长
+                        if (chargeTime > MAX_CHARGE_TIME) chargeTime = MAX_CHARGE_TIME;
+                    }
+
+                    // 更新UI
+                    const progress = (chargeTime / MAX_CHARGE_TIME) * 100;
+                    chargeBarContainer.classList.remove('opacity-0', 'translate-y-4');
+                    chargeBar.style.width = `${progress}%`;
+                    chargePercent.innerText = `${Math.floor(progress)}%`;
+                    statusTip.innerText = progress >= 100 ? "⚡ 能量充盈！请张开手掌释放！" : `✊ 魔法蓄力中... ${Math.floor(progress)}%`;
+                } else {
+                    // 【手掌张开状态】
+                    // 检测状态机突变：从 握拳(fist) -> 张开(open) 的瞬间触发释放
+                    if (lastHandState === 'fist' && chargeTime > 0.2) {
+                        const ratio = chargeTime / MAX_CHARGE_TIME;
+                        
+                        // 从手部当前位置下方发射火箭，冲向手部高度
+                        rockets.push(new Rocket(handPos.x, canvas.height, handPos.y, ratio));
+                        
+                        // 重置蓄力
+                        isCharging = false;
+                        chargeTime = 0;
+                        lastHandState = 'open';
+                        chargeBarContainer.classList.add('opacity-0', 'translate-y-4');
+                        statusTip.innerText = "🖐 释放成功！继续握拳蓄力吧。";
+                    } else if (lastHandState !== 'double_open') {
+                        lastHandState = 'open';
+                        statusTip.innerText = "🖐 请握紧拳头开始积蓄魔法...";
+                    }
+                }
+            } else {
+                // 未检测到手部
+                if (isCharging) {
+                    // 失去踪迹时保护性重置
+                    isCharging = false;
+                    chargeTime = 0;
+                    lastHandState = 'open';
+                    chargeBarContainer.classList.add('opacity-0', 'translate-y-4');
+                }
+                statusTip.innerText = "👋 请将手掌举入右上方摄像头视野内";
+                // 恢复普通状态样式
+                statusTip.className = "mt-4 px-6 py-2 rounded-full bg-black/40 border border-white/10 text-white/80 text-sm tracking-wide backdrop-blur-md transition-all duration-300";
+            }
+        }
+
+        // --- 初始化 MediaPipe 模型与摄像头启动控制 ---
+        function initMediaPipe() {
+            startBtn.classList.add('hidden');
+            loadingIcon.classList.remove('hidden');
+            setupTitle.innerText = "正在唤醒魔法...";
+            setupDesc.innerText = "正在通过高速网络加载 AI 视觉视觉识别模型，请稍候...";
+
+            const hands = new Hands({
+                locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+            });
+
+            hands.setOptions({
+                maxNumHands: 2,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.65, // 提高置信度阈值确保手势稳定性
+                minTrackingConfidence: 0.65
+            });
+
+            hands.onResults(onResults);
+
+            const camera = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({ image: videoElement });
+                },
+                width: 480,
+                height: 360
+            });
+
+            camera.start()
+                .then(() => {
+                    // 模型与摄像头初始化成功，淡出遮罩层
+                    setupOverlay.classList.add('opacity-0');
+                    setTimeout(() => setupOverlay.remove(), 700);
+                    statusTip.innerText = "👋 欢迎！举起手掌即可开始互动";
+                    // 启动动画渲染循环
+                    requestAnimationFrame(renderLoop);
+                })
+                .catch(err => {
+                    console.error(err);
+                    loadingIcon.classList.add('hidden');
+                    startBtn.classList.remove('hidden');
+                    setupTitle.innerText = "魔法启动失败";
+                    setupDesc.innerText = "无法访问您的摄像头。请确保授予了浏览器权限，并且没有其他程序占用摄像头后重试。";
+                });
+        }
+
+        startBtn.addEventListener('click', initMediaPipe);
+    </script>
+</body>
+</html>
